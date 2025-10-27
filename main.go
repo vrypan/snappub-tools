@@ -4,6 +4,8 @@ import (
 	"snappub-tools/commands"
 )
 
+var Version = "dev"
+
 func main() {
-	commands.Execute()
+	commands.Execute(Version)
 }

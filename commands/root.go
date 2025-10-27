@@ -10,6 +10,7 @@ import (
 )
 
 var cfgFile string
+var version string
 
 var rootCmd = &cobra.Command{
 	Use:   "snappub",
@@ -17,7 +18,8 @@ var rootCmd = &cobra.Command{
 	Long:  `A set of tools that implement the basic functionality of snappub.`,
 }
 
-func Execute() {
+func Execute(v string) {
+	version = v
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
