@@ -1,15 +1,36 @@
 snappub-tools are a set of tools that implement the basic functionality of [snappub](https://github.com/vrypan/snappub).
 
-They are written in Go. 
+They are written in Go and provide a CLI interface for interacting with Farcaster via Snapchain.
 
-It will be a single command "snappub" with subcommands, so use cobra and viper.
-Put the commands in a separate, commands/ folder.
+## Installation
 
-We will also have to integrate with snapchain, so you will use the latest vrypan/farcaster-go/farcaster-go package.
+### Via Homebrew
 
-Commands:
+```bash
+brew install vrypan/tap/snappub
+```
 
-## snappub config
+### From Source
+
+```bash
+go install github.com/vrypan/snappub-tools@latest
+```
+
+### Download Binaries
+
+Download pre-built binaries for your platform from the [releases page](https://github.com/vrypan/snappub-tools/releases).
+
+## Commands
+
+### snappub version
+
+Display the current version of snappub.
+
+```bash
+snappub version
+```
+
+### snappub config
 
 - snappub config ls
 - snappub config get <param>
@@ -31,9 +52,9 @@ appKeys:
 
 ## Generating Application Keys
 
-To generate new Farcaster application keys (signers), use the standalone [fc-appkey](../fc-appkey) tool.
+To generate new Farcaster application keys (signers), use the standalone [fc-appkey](https://github.com/vrypan/fc-appkey) tool.
 
-## snappub ping
+### snappub ping
 
 snappub ping <url> [--fid=<fid>|--fname=<fname>] [--appkey=<hex>] [--debug]
 
@@ -45,7 +66,7 @@ Options:
 - If `--appkey` is not provided, the key will be looked up from config using `appKeys.<fid>`
 - `--debug` will show the full server response as JSON
 
-## snappub updates
+### snappub updates
 
 snappub updates [url] [--fid=<fid>|--fname=<fname>] [--results=<n>] [--since=<timestamp>]
 
