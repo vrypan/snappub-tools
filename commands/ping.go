@@ -107,15 +107,21 @@ If --appkey is not provided, the key will be looked up from config using appkeys
 		expandedKey := ed25519.NewKeyFromSeed(privateKeyBytes)
 		publicKey := expandedKey.Public().(ed25519.PublicKey)
 
-		// Create cast add body with empty text and parent URL
+		// Create cast add body with empty text, parent URL and snuppub:update
 		castAddBody := &pb.CastAddBody{
 			Text: "\n",
 			Parent: &pb.CastAddBody_ParentUrl{
 				ParentUrl: url,
 			},
+			Embeds: []*pb.Embed{
+				{
+					Embed: &pb.Embed_Url{Url: "snuppub:update"},
+				},
+			},
 		}
 
 		// Create message data
+
 		messageData := &pb.MessageData{
 			Type:      pb.MessageType_MESSAGE_TYPE_CAST_ADD,
 			Fid:       fid,

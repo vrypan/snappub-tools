@@ -133,6 +133,17 @@ Use --since to filter casts after a specific timestamp (ISO 8601 format).`,
 				continue
 			}
 
+			// Check if this cast is a snappub:update
+			isUpdate := false
+			for _, embed := range castBody.GetEmbeds() {
+				if embed.GetUrl() == "snuppub:update" {
+					isUpdate = true
+				}
+			}
+			if !isUpdate {
+				continue
+			}
+
 			// Convert timestamp to Unix timestamp
 			timestamp := int64(msg.Data.Timestamp) + FARCASTER_EPOCH
 
