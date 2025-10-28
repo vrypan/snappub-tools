@@ -29,3 +29,7 @@ go.work
 
 # Claude Code
 .claude/
+
+# Binaries
+/snappub
+/snappub-tools

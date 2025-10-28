@@ -17,6 +17,7 @@ var (
 	updatesFid     uint64
 	updatesResults uint32
 	updatesSince   string
+	updatesAll     bool
 )
 
 var updatesCmd = &cobra.Command{
@@ -31,7 +32,8 @@ If [url] is provided, only casts with that specific parentUrl will be shown.
 If [url] is not provided, all casts with any parentUrl will be shown.
 
 Use --results to limit the number of results (default: 10).
-Use --since to filter casts after a specific timestamp (ISO 8601 format).`,
+Use --since to filter casts after a specific timestamp (ISO 8601 format).
+Use --all to paginate through all results until --results limit is reached.`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		var filterUrl string
@@ -77,9 +79,11 @@ Use --since to filter casts after a specific timestamp (ISO 8601 format).`,
 
 		// Build the request
 		reverse := true
+		pageSize := uint32(100) // Fetch 100 messages per page to avoid gRPC message size limits
 		request := &pb.FidTimestampRequest{
-			Fid:     updatesFid,
-			Reverse: &reverse,
+			Fid:      updatesFid,
+			Reverse:  &reverse,
+			PageSize: &pageSize,
 		}
 
 		// Parse --since timestamp if provided and add to request
@@ -94,12 +98,6 @@ Use --since to filter casts after a specific timestamp (ISO 8601 format).`,
 			request.StartTimestamp = &farcasterTimestamp
 		}
 
-		// Get all cast messages by FID
-		response, err := client.GetAllCastMessagesByFid(ctx, request)
-		if err != nil {
-			return fmt.Errorf("error fetching casts: %w", err)
-		}
-
 		// Parse --since timestamp for client-side filtering if needed
 		var sinceTimestamp int64
 		if updatesSince != "" {
@@ -110,59 +108,82 @@ Use --since to filter casts after a specific timestamp (ISO 8601 format).`,
 			sinceTimestamp = sinceTime.Unix()
 		}
 
-		// Filter and display results
+		// Pagination loop
 		count := uint32(0)
-		for _, msg := range response.Messages {
-			if count >= updatesResults {
+		var pageToken []byte
+
+		for {
+			// Set page token if we have one from previous iteration
+			if pageToken != nil {
+				request.PageToken = pageToken
+			}
+
+			// Get all cast messages by FID
+			response, err := client.GetAllCastMessagesByFid(ctx, request)
+			if err != nil {
+				return fmt.Errorf("error fetching casts: %w", err)
+			}
+
+			// Filter and display results
+			for _, msg := range response.Messages {
+				if count >= updatesResults {
+					return nil
+				}
+
+				// Only process CastAdd messages
+				if msg.Data.Type != pb.MessageType_MESSAGE_TYPE_CAST_ADD {
+					continue
+				}
+
+				castBody := msg.Data.GetCastAddBody()
+				if castBody == nil {
+					continue
+				}
+
+				// Check if this cast has a parentUrl
+				parentUrl := castBody.GetParentUrl()
+				if parentUrl == "" {
+					continue
+				}
+
+				// Check if this cast is a snappub:update
+				isUpdate := false
+				for _, embed := range castBody.GetEmbeds() {
+					if embed.GetUrl() == "snuppub:update" {
+						isUpdate = true
+					}
+				}
+				if !isUpdate {
+					continue
+				}
+
+				// Convert timestamp to Unix timestamp
+				timestamp := int64(msg.Data.Timestamp) + FARCASTER_EPOCH
+
+				// If --since is specified, filter by timestamp (exclusive)
+				if updatesSince != "" && timestamp <= sinceTimestamp {
+					continue
+				}
+
+				// If filterUrl is specified, only show matching casts
+				if filterUrl != "" && parentUrl != filterUrl {
+					continue
+				}
+
+				// Convert timestamp to ISO 8601
+				isoTime := time.Unix(timestamp, 0).UTC().Format(time.RFC3339)
+
+				// Output: <url> <timestamp>
+				fmt.Printf("%s %s\n", parentUrl, isoTime)
+				count++
+			}
+
+			// Check if we should continue paginating
+			if !updatesAll || response.NextPageToken == nil || len(response.NextPageToken) == 0 {
 				break
 			}
 
-			// Only process CastAdd messages
-			if msg.Data.Type != pb.MessageType_MESSAGE_TYPE_CAST_ADD {
-				continue
-			}
-
-			castBody := msg.Data.GetCastAddBody()
-			if castBody == nil {
-				continue
-			}
-
-			// Check if this cast has a parentUrl
-			parentUrl := castBody.GetParentUrl()
-			if parentUrl == "" {
-				continue
-			}
-
-			// Check if this cast is a snappub:update
-			isUpdate := false
-			for _, embed := range castBody.GetEmbeds() {
-				if embed.GetUrl() == "snuppub:update" {
-					isUpdate = true
-				}
-			}
-			if !isUpdate {
-				continue
-			}
-
-			// Convert timestamp to Unix timestamp
-			timestamp := int64(msg.Data.Timestamp) + FARCASTER_EPOCH
-
-			// If --since is specified, filter by timestamp (exclusive)
-			if updatesSince != "" && timestamp <= sinceTimestamp {
-				continue
-			}
-
-			// If filterUrl is specified, only show matching casts
-			if filterUrl != "" && parentUrl != filterUrl {
-				continue
-			}
-
-			// Convert timestamp to ISO 8601
-			isoTime := time.Unix(timestamp, 0).UTC().Format(time.RFC3339)
-
-			// Output: <url> <timestamp>
-			fmt.Printf("%s %s\n", parentUrl, isoTime)
-			count++
+			pageToken = response.NextPageToken
 		}
 
 		return nil
@@ -175,4 +196,5 @@ func init() {
 	updatesCmd.Flags().Uint64Var(&updatesFid, "fid", 0, "Farcaster ID (FID)")
 	updatesCmd.Flags().Uint32Var(&updatesResults, "results", 10, "Number of results to return")
 	updatesCmd.Flags().StringVar(&updatesSince, "since", "", "Show only casts after this timestamp (ISO 8601 format)")
+	updatesCmd.Flags().BoolVar(&updatesAll, "all", false, "Paginate through all results")
 }
