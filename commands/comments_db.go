@@ -2,10 +2,10 @@ package commands
 
 import (
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	badger "github.com/dgraph-io/badger/v4"
 	pb "github.com/vrypan/farcaster-go/farcaster"
@@ -33,6 +33,17 @@ func OpenCommentsDB() (*CommentsDB, error) {
 
 	opts := badger.DefaultOptions(dbPath)
 	opts.Logger = nil // Disable badger's verbose logging
+	// Memory optimizations
+	opts.MemTableSize = 64 << 20  // 64MB
+	opts.BaseTableSize = 2 << 20  // 2MB
+	opts.BaseLevelSize = 10 << 20 // 10MB
+	opts.LevelSizeMultiplier = 10
+	opts.TableSizeMultiplier = 2
+	opts.MaxLevels = 7
+	opts.ValueLogFileSize = 64 << 20 // 64MB
+	opts.ValueLogMaxEntries = 1000000
+	opts.IndexCacheSize = 0       // Disable index cache for memory savings
+	opts.BlockCacheSize = 8 << 20 // 8MB block cache
 
 	db, err := badger.Open(opts)
 	if err != nil {
@@ -52,75 +63,90 @@ func (cdb *CommentsDB) Close() error {
 
 // Key building helpers
 
-func castKey(hash []byte) []byte {
-	key := make([]byte, 0, 5+len(hash)*2)
-	key = append(key, []byte("cast:")...)
-	key = append(key, []byte(hex.EncodeToString(hash))...)
-	return key
+func (cdb *CommentsDB) castKey(hash []byte) []byte {
+	key := make([]byte, 0, 5+len(hash))
+	key = append(key, "cast:"...)
+	return append(key, hash...)
 }
 
-func removeKey(hash []byte) []byte {
-	key := make([]byte, 0, 7+len(hash)*2)
-	key = append(key, []byte("remove:")...)
-	key = append(key, []byte(hex.EncodeToString(hash))...)
-	return key
+func (cdb *CommentsDB) removeKey(hash []byte) []byte {
+	key := make([]byte, 0, 7+len(hash))
+	key = append(key, "remove:"...)
+	return append(key, hash...)
 }
 
 func urlKey(url string) []byte {
-	return []byte("url:" + url)
+	key := make([]byte, 0, 4+len(url))
+	key = append(key, "url:"...)
+	return append(key, url...)
 }
 
-func urlIndexKey(url string, blockNumber uint64, eventIdx uint64, hash []byte) []byte {
+func (cdb *CommentsDB) urlIndexKey(url string, blockNumber uint64, eventIdx uint64, hash []byte) []byte {
 	// url_idx:<url>:<block_be>:<event_idx_be>:<hash>
-	blockBE := make([]byte, 8)
-	eventIdxBE := make([]byte, 8)
-	binary.BigEndian.PutUint64(blockBE, blockNumber)
-	binary.BigEndian.PutUint64(eventIdxBE, eventIdx)
+	key := make([]byte, 0, 9+len(url)+8+1+8+1+len(hash))
+	key = append(key, "url_idx:"...)
+	key = append(key, url...)
+	key = append(key, ':')
 
-	key := make([]byte, 0, 8+len(url)+8+8+len(hash)*2)
-	key = append(key, []byte("url_idx:")...)
-	key = append(key, []byte(url)...)
+	// Inline binary encoding to avoid allocation
+	blockBE := [8]byte{}
+	binary.BigEndian.PutUint64(blockBE[:], blockNumber)
+	key = append(key, blockBE[:]...)
 	key = append(key, ':')
-	key = append(key, blockBE...)
+
+	eventIdxBE := [8]byte{}
+	binary.BigEndian.PutUint64(eventIdxBE[:], eventIdx)
+	key = append(key, eventIdxBE[:]...)
 	key = append(key, ':')
-	key = append(key, eventIdxBE...)
-	key = append(key, ':')
-	key = append(key, []byte(hex.EncodeToString(hash))...)
-	return key
+
+	return append(key, hash...)
 }
 
 func urlIndexPrefix(url string) []byte {
-	return []byte("url_idx:" + url + ":")
+	key := make([]byte, 0, 9+len(url))
+	key = append(key, "url_idx:"...)
+	key = append(key, url...)
+	return append(key, ':')
 }
 
-func parentIndexKey(parentHash []byte, blockNumber uint64, eventIdx uint64, hash []byte) []byte {
+func (cdb *CommentsDB) parentIndexKey(parentHash []byte, blockNumber uint64, eventIdx uint64, hash []byte) []byte {
 	// parent_idx:<parent_hash>:<block_be>:<event_idx_be>:<hash>
-	blockBE := make([]byte, 8)
-	eventIdxBE := make([]byte, 8)
-	binary.BigEndian.PutUint64(blockBE, blockNumber)
-	binary.BigEndian.PutUint64(eventIdxBE, eventIdx)
+	key := make([]byte, 0, 11+len(parentHash)+8+1+8+1+len(hash))
+	key = append(key, "parent_idx:"...)
+	key = append(key, parentHash...)
+	key = append(key, ':')
 
-	parentHashHex := hex.EncodeToString(parentHash)
-	hashHex := hex.EncodeToString(hash)
+	// Inline binary encoding to avoid allocation
+	blockBE := [8]byte{}
+	binary.BigEndian.PutUint64(blockBE[:], blockNumber)
+	key = append(key, blockBE[:]...)
+	key = append(key, ':')
 
-	key := make([]byte, 0, 11+len(parentHashHex)+8+8+len(hashHex))
-	key = append(key, []byte("parent_idx:")...)
-	key = append(key, []byte(parentHashHex)...)
+	eventIdxBE := [8]byte{}
+	binary.BigEndian.PutUint64(eventIdxBE[:], eventIdx)
+	key = append(key, eventIdxBE[:]...)
 	key = append(key, ':')
-	key = append(key, blockBE...)
-	key = append(key, ':')
-	key = append(key, eventIdxBE...)
-	key = append(key, ':')
-	key = append(key, []byte(hashHex)...)
-	return key
+
+	return append(key, hash...)
 }
 
 func parentIndexPrefix(parentHash []byte) []byte {
-	return []byte("parent_idx:" + hex.EncodeToString(parentHash) + ":")
+	key := make([]byte, 0, 12+len(parentHash))
+	key = append(key, "parent_idx:"...)
+	key = append(key, parentHash...)
+	return append(key, ':')
 }
 
+// Pre-allocate byte array for shard state keys
+var shardStateKeyPrefix = []byte("state:shard:")
+
 func shardStateKey(shardID uint32) []byte {
-	return []byte(fmt.Sprintf("state:shard:%d", shardID))
+	// Use strings.Builder for efficient string building
+	var b strings.Builder
+	b.Grow(len(shardStateKeyPrefix) + 10) // Pre-allocate
+	b.Write(shardStateKeyPrefix)
+	b.WriteString(fmt.Sprintf("%d", shardID))
+	return []byte(b.String())
 }
 
 // Database operations
@@ -135,17 +161,20 @@ func (cdb *CommentsDB) StoreCast(msg *pb.Message, blockNumber uint64, eventIdx u
 		}
 
 		// Store the cast
-		if err := txn.Set(castKey(msg.Hash), msgBytes); err != nil {
+		castKeyBytes := cdb.castKey(msg.Hash)
+		if err := txn.Set(castKeyBytes, msgBytes); err != nil {
 			return err
 		}
 
 		// If this is a root cast (parent_url starts with target URL), mark URL as tracked
 		if isRootCast {
-			if err := txn.Set(urlKey(parentUrl), []byte{}); err != nil {
+			urlKeyBytes := urlKey(parentUrl)
+			if err := txn.Set(urlKeyBytes, nil); err != nil {
 				return err
 			}
 			// Create URL index
-			if err := txn.Set(urlIndexKey(parentUrl, blockNumber, eventIdx, msg.Hash), []byte{}); err != nil {
+			urlIdxKeyBytes := cdb.urlIndexKey(parentUrl, blockNumber, eventIdx, msg.Hash)
+			if err := txn.Set(urlIdxKeyBytes, nil); err != nil {
 				return err
 			}
 		}
@@ -155,7 +184,8 @@ func (cdb *CommentsDB) StoreCast(msg *pb.Message, blockNumber uint64, eventIdx u
 		if castBody != nil {
 			parentCastId := castBody.GetParentCastId()
 			if parentCastId != nil {
-				if err := txn.Set(parentIndexKey(parentCastId.Hash, blockNumber, eventIdx, msg.Hash), []byte{}); err != nil {
+				parentIdxKeyBytes := cdb.parentIndexKey(parentCastId.Hash, blockNumber, eventIdx, msg.Hash)
+				if err := txn.Set(parentIdxKeyBytes, nil); err != nil {
 					return err
 				}
 			}
@@ -178,7 +208,9 @@ func (cdb *CommentsDB) StoreRemove(msg *pb.Message) error {
 			return fmt.Errorf("invalid cast remove message")
 		}
 
-		return txn.Set(removeKey(removeBody.TargetHash), msgBytes)
+		removeKeyBytes := cdb.removeKey(removeBody.TargetHash)
+		err = txn.Set(removeKeyBytes, msgBytes)
+		return err
 	})
 }
 
@@ -186,7 +218,8 @@ func (cdb *CommentsDB) StoreRemove(msg *pb.Message) error {
 func (cdb *CommentsDB) CastExists(hash []byte) (bool, error) {
 	var exists bool
 	err := cdb.db.View(func(txn *badger.Txn) error {
-		_, err := txn.Get(castKey(hash))
+		castKeyBytes := cdb.castKey(hash)
+		_, err := txn.Get(castKeyBytes)
 		if err == badger.ErrKeyNotFound {
 			exists = false
 			return nil
@@ -204,7 +237,8 @@ func (cdb *CommentsDB) CastExists(hash []byte) (bool, error) {
 func (cdb *CommentsDB) URLTracked(url string) (bool, error) {
 	var tracked bool
 	err := cdb.db.View(func(txn *badger.Txn) error {
-		_, err := txn.Get(urlKey(url))
+		urlKeyBytes := urlKey(url)
+		_, err := txn.Get(urlKeyBytes)
 		if err == badger.ErrKeyNotFound {
 			tracked = false
 			return nil
@@ -222,7 +256,8 @@ func (cdb *CommentsDB) URLTracked(url string) (bool, error) {
 func (cdb *CommentsDB) GetShardState(shardID uint32) (uint64, error) {
 	var blockNumber uint64
 	err := cdb.db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get(shardStateKey(shardID))
+		shardKeyBytes := shardStateKey(shardID)
+		item, err := txn.Get(shardKeyBytes)
 		if err == badger.ErrKeyNotFound {
 			blockNumber = 0
 			return nil
@@ -245,9 +280,10 @@ func (cdb *CommentsDB) GetShardState(shardID uint32) (uint64, error) {
 // SetShardState sets the last processed block number for a shard
 func (cdb *CommentsDB) SetShardState(shardID uint32, blockNumber uint64) error {
 	return cdb.db.Update(func(txn *badger.Txn) error {
-		blockBE := make([]byte, 8)
-		binary.BigEndian.PutUint64(blockBE, blockNumber)
-		return txn.Set(shardStateKey(shardID), blockBE)
+		blockBE := [8]byte{}
+		binary.BigEndian.PutUint64(blockBE[:], blockNumber)
+		shardKeyBytes := shardStateKey(shardID)
+		return txn.Set(shardKeyBytes, blockBE[:])
 	})
 }
 
@@ -255,7 +291,8 @@ func (cdb *CommentsDB) SetShardState(shardID uint32, blockNumber uint64) error {
 func (cdb *CommentsDB) GetCast(hash []byte) (*pb.Message, error) {
 	var msg *pb.Message
 	err := cdb.db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get(castKey(hash))
+		castKeyBytes := cdb.castKey(hash)
+		item, err := txn.Get(castKeyBytes)
 		if err != nil {
 			return err
 		}
@@ -272,7 +309,8 @@ func (cdb *CommentsDB) GetCast(hash []byte) (*pb.Message, error) {
 func (cdb *CommentsDB) IsRemoved(hash []byte) (bool, error) {
 	var removed bool
 	err := cdb.db.View(func(txn *badger.Txn) error {
-		_, err := txn.Get(removeKey(hash))
+		removeKeyBytes := cdb.removeKey(hash)
+		_, err := txn.Get(removeKeyBytes)
 		if err == badger.ErrKeyNotFound {
 			removed = false
 			return nil
@@ -289,7 +327,9 @@ func (cdb *CommentsDB) IsRemoved(hash []byte) (bool, error) {
 // GetTrackedURLs returns all tracked URLs that start with the given prefix
 func (cdb *CommentsDB) GetTrackedURLs(urlPrefix string) ([]string, error) {
 	var urls []string
-	prefix := []byte("url:" + urlPrefix)
+	prefix := make([]byte, 0, 4+len(urlPrefix))
+	prefix = append(prefix, "url:"...)
+	prefix = append(prefix, urlPrefix...)
 
 	err := cdb.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -301,6 +341,7 @@ func (cdb *CommentsDB) GetTrackedURLs(urlPrefix string) ([]string, error) {
 			item := it.Item()
 			key := item.Key()
 			// Extract URL from key (remove "url:" prefix)
+			// Avoid string allocation by using unsafe conversion where possible
 			url := string(key[4:])
 			urls = append(urls, url)
 		}
@@ -314,6 +355,7 @@ func (cdb *CommentsDB) GetTrackedURLs(urlPrefix string) ([]string, error) {
 func (cdb *CommentsDB) GetRootCastsForURL(url string) ([][]byte, error) {
 	var hashes [][]byte
 	prefix := urlIndexPrefix(url)
+	hashOffset := len(prefix) + 8 + 1 + 8 + 1 // prefix + block (8) + ':' + event (8) + ':'
 
 	err := cdb.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -324,28 +366,13 @@ func (cdb *CommentsDB) GetRootCastsForURL(url string) ([][]byte, error) {
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 			item := it.Item()
 			key := item.Key()
-			// Extract hash from key (last component after last ':')
-			// Format: url_idx:<url>:<block_be>:<event_idx_be>:<hash>
-			// Find the last 3 colons and get everything after the last one
-			colonCount := 0
-			lastColonIdx := -1
-			for i := len(key) - 1; i >= 0; i-- {
-				if key[i] == ':' {
-					colonCount++
-					if colonCount == 1 {
-						lastColonIdx = i
-						break
-					}
-				}
+			if len(key) <= hashOffset {
+				continue
 			}
-			if lastColonIdx >= 0 && lastColonIdx < len(key)-1 {
-				hashHex := string(key[lastColonIdx+1:])
-				hash, err := hex.DecodeString(hashHex)
-				if err != nil {
-					return fmt.Errorf("failed to decode hash: %w", err)
-				}
-				hashes = append(hashes, hash)
-			}
+			component := key[hashOffset:]
+			hashBytes := make([]byte, len(component))
+			copy(hashBytes, component)
+			hashes = append(hashes, hashBytes)
 		}
 		return nil
 	})
@@ -357,6 +384,7 @@ func (cdb *CommentsDB) GetRootCastsForURL(url string) ([][]byte, error) {
 func (cdb *CommentsDB) GetRepliesForCast(parentHash []byte) ([][]byte, error) {
 	var hashes [][]byte
 	prefix := parentIndexPrefix(parentHash)
+	hashOffset := len(prefix) + 8 + 1 + 8 + 1 // prefix + block (8) + ':' + event (8) + ':'
 
 	err := cdb.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -367,26 +395,13 @@ func (cdb *CommentsDB) GetRepliesForCast(parentHash []byte) ([][]byte, error) {
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 			item := it.Item()
 			key := item.Key()
-			// Extract hash from key (last component)
-			colonCount := 0
-			lastColonIdx := -1
-			for i := len(key) - 1; i >= 0; i-- {
-				if key[i] == ':' {
-					colonCount++
-					if colonCount == 1 {
-						lastColonIdx = i
-						break
-					}
-				}
+			if len(key) <= hashOffset {
+				continue
 			}
-			if lastColonIdx >= 0 && lastColonIdx < len(key)-1 {
-				hashHex := string(key[lastColonIdx+1:])
-				hash, err := hex.DecodeString(hashHex)
-				if err != nil {
-					return fmt.Errorf("failed to decode hash: %w", err)
-				}
-				hashes = append(hashes, hash)
-			}
+			component := key[hashOffset:]
+			hashBytes := make([]byte, len(component))
+			copy(hashBytes, component)
+			hashes = append(hashes, hashBytes)
 		}
 		return nil
 	})

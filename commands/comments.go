@@ -145,6 +145,7 @@ func runSync(url string) error {
 
 	// Spinner characters
 	spinChars := []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
+	checkChar := '✔'
 	spinIdx := 0
 
 	// Combined counters across all shards
@@ -167,7 +168,6 @@ func runSync(url string) error {
 
 		// Process in batches to avoid gRPC message size limits
 		batchSize := uint64(100)
-
 		for batchStart := startBlock; batchStart <= currentBlock; batchStart += batchSize {
 			batchEnd := batchStart + batchSize - 1
 			if batchEnd > currentBlock {
@@ -233,7 +233,8 @@ func runSync(url string) error {
 		} // End batch loop
 	}
 
-	fmt.Printf("\n") // Clear progress line
+	fmt.Printf("\r%c [%d Chunks]  Cast Add: %d  Remove: %d\n",
+		checkChar, totalChunksProcessed, totalCastsStored, totalRemovesStored)
 
 	fmt.Printf("\nSync complete!\n")
 	return nil
@@ -326,7 +327,7 @@ type CastExport struct {
 }
 
 type EmbedExport struct {
-	URL    string      `json:"url,omitempty"`
+	URL    string        `json:"url,omitempty"`
 	CastID *CastIDExport `json:"castId,omitempty"`
 }
 
