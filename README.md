@@ -22,6 +22,47 @@ Download pre-built binaries for your platform from the [releases page](https://g
 
 ## Commands
 
+### snappub comments sync
+
+Fetch cast threads for a URL prefix and store them locally in `~/.config/snappub/comments.db` (Badger). Sync keeps per-shard progress, paginates hub snapshots in batches of 100 blocks, and caches Farcaster profile metadata: for every author, mentioned fid, and parent cast fid it looks up `GetUserDataByFid` only when the cached entry (username / display name / avatar) is older than six hours.
+
+```bash
+snappub comments sync https://example.com --start-block -5000
+```
+
+`--start-block` controls the starting block:
+
+- `0` (default): resume from the saved shard state
+- positive: start from that explicit block number
+- negative: start from `currentHeight - N`
+
+Configure the hub endpoint first via `snappub config set node <host:port>`.
+
+### snappub comments export
+
+Export previously synced threads to JSON. Each output file contains the cast tree plus a `users` dictionary keyed by fid, populated from the cached profile data (refreshing entries older than the TTL when necessary).
+
+```bash
+snappub comments export https://example.com
+```
+
+Example structure:
+
+```json
+{
+  "parentUrl": "https://example.com/post/123",
+  "lastUpdated": "2025-10-30T12:34:56Z",
+  "rootCasts": [...],
+  "users": {
+    "123": {
+      "username": "username123",
+      "displayName": "Display Name",
+      "avatar": "https://..."
+    }
+  }
+}
+```
+
 ### snappub version
 
 Display the current version of snappub.
@@ -50,9 +91,9 @@ appKeys:
   "280": "0x1234...abcd"  # vrypan, fid=280
 ```
 
-## Generating Application Keys
-
-To generate new Farcaster application keys (signers), use the standalone [fc-appkey](https://github.com/vrypan/fc-appkey) tool.
+> [!NOTE]
+> 
+> To generate Farcaster application keys (signers), use the standalone [fc-appkey](https://github.com/vrypan/fc-appkey) tool.
 
 ### snappub ping
 

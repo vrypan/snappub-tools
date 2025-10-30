@@ -2,10 +2,12 @@ package commands
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	badger "github.com/dgraph-io/badger/v4"
 	pb "github.com/vrypan/farcaster-go/farcaster"
@@ -140,6 +142,8 @@ func parentIndexPrefix(parentHash []byte) []byte {
 // Pre-allocate byte array for shard state keys
 var shardStateKeyPrefix = []byte("state:shard:")
 
+const userCacheKeyPrefix = "user:"
+
 func shardStateKey(shardID uint32) []byte {
 	// Use strings.Builder for efficient string building
 	var b strings.Builder
@@ -147,6 +151,18 @@ func shardStateKey(shardID uint32) []byte {
 	b.Write(shardStateKeyPrefix)
 	b.WriteString(fmt.Sprintf("%d", shardID))
 	return []byte(b.String())
+}
+
+func userKey(fid uint64) []byte {
+	return []byte(fmt.Sprintf("%s%d", userCacheKeyPrefix, fid))
+}
+
+type CachedUserData struct {
+	Fid         uint64 `json:"fid"`
+	Username    string `json:"username,omitempty"`
+	DisplayName string `json:"displayName,omitempty"`
+	Avatar      string `json:"avatar,omitempty"`
+	UpdatedAt   int64  `json:"updatedAt"`
 }
 
 // Database operations
@@ -407,4 +423,60 @@ func (cdb *CommentsDB) GetRepliesForCast(parentHash []byte) ([][]byte, error) {
 	})
 
 	return hashes, err
+}
+
+// GetCachedUser retrieves cached user metadata and indicates if it is still fresh
+func (cdb *CommentsDB) GetCachedUser(fid uint64, ttl time.Duration) (*CachedUserData, bool, error) {
+	var cached *CachedUserData
+
+	err := cdb.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(userKey(fid))
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		return item.Value(func(val []byte) error {
+			var data CachedUserData
+			if err := json.Unmarshal(val, &data); err != nil {
+				return err
+			}
+			cached = &data
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if cached == nil {
+		return nil, false, nil
+	}
+
+	if ttl <= 0 {
+		return cached, true, nil
+	}
+
+	updatedAt := time.Unix(cached.UpdatedAt, 0)
+	if time.Since(updatedAt) > ttl {
+		return cached, false, nil
+	}
+	return cached, true, nil
+}
+
+// StoreCachedUser saves user metadata and updates its timestamp
+func (cdb *CommentsDB) StoreCachedUser(data *CachedUserData) error {
+	if data == nil {
+		return fmt.Errorf("nil user data")
+	}
+	data.UpdatedAt = time.Now().Unix()
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal cached user data: %w", err)
+	}
+
+	return cdb.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(userKey(data.Fid), payload)
+	})
 }

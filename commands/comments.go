@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,8 @@ import (
 var (
 	syncStartBlock int64
 )
+
+const userCacheTTL = 6 * time.Hour
 
 var commentsCmd = &cobra.Command{
 	Use:   "comments",
@@ -61,6 +64,41 @@ func init() {
 	syncCmd.Flags().Int64Var(&syncStartBlock, "start-block", 0, "Block number to start from (0=resume from saved state, positive=specific block, negative=current-N blocks)")
 }
 
+func fetchAndCacheUserData(ctx context.Context, client pb.HubServiceClient, db *CommentsDB, fid uint64) (*CachedUserData, error) {
+	if client == nil {
+		return nil, fmt.Errorf("no hub client available")
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	resp, err := client.GetUserDataByFid(reqCtx, &pb.FidRequest{Fid: fid})
+	if err != nil {
+		return nil, err
+	}
+
+	profile := &CachedUserData{Fid: fid}
+	for _, msg := range resp.Messages {
+		body := msg.Data.GetUserDataBody()
+		if body == nil {
+			continue
+		}
+		switch body.Type {
+		case pb.UserDataType_USER_DATA_TYPE_USERNAME:
+			profile.Username = body.Value
+		case pb.UserDataType_USER_DATA_TYPE_DISPLAY:
+			profile.DisplayName = body.Value
+		case pb.UserDataType_USER_DATA_TYPE_PFP:
+			profile.Avatar = body.Value
+		}
+	}
+
+	if err := db.StoreCachedUser(profile); err != nil {
+		return nil, err
+	}
+	return profile, nil
+}
+
 func runSync(url string) error {
 	fmt.Printf("Syncing comments for URL: %s\n", url)
 
@@ -91,6 +129,31 @@ func runSync(url string) error {
 	info, err := client.GetInfo(ctx, &pb.GetInfoRequest{})
 	if err != nil {
 		return fmt.Errorf("failed to get hub info: %w", err)
+	}
+
+	processedFids := make(map[uint64]struct{})
+	ensureUserData := func(fid uint64) {
+		if fid == 0 {
+			return
+		}
+		if _, seen := processedFids[fid]; seen {
+			return
+		}
+
+		_, fresh, err := db.GetCachedUser(fid, userCacheTTL)
+		if err != nil {
+			fmt.Printf("\nWarning: failed to read cached user data for fid %d: %v\n", fid, err)
+			processedFids[fid] = struct{}{}
+			return
+		}
+
+		if !fresh {
+			if _, err := fetchAndCacheUserData(ctx, client, db, fid); err != nil {
+				fmt.Printf("\nWarning: failed to fetch user data for fid %d: %v\n", fid, err)
+			}
+		}
+
+		processedFids[fid] = struct{}{}
 	}
 
 	// Calculate start blocks for each shard before processing
@@ -195,6 +258,17 @@ func runSync(url string) error {
 						// Process based on message type
 						switch msg.Data.Type {
 						case pb.MessageType_MESSAGE_TYPE_CAST_ADD:
+							ensureUserData(msg.Data.Fid)
+							castBody := msg.Data.GetCastAddBody()
+							if castBody != nil {
+								for _, fid := range castBody.Mentions {
+									ensureUserData(fid)
+								}
+								if parentCastId := castBody.GetParentCastId(); parentCastId != nil {
+									ensureUserData(parentCastId.Fid)
+								}
+							}
+
 							stored, err := processCastAdd(db, msg, url, blockNum, uint64(msgIdx))
 							if err != nil {
 								fmt.Printf("\n") // Clear progress line before error
@@ -205,6 +279,7 @@ func runSync(url string) error {
 							}
 
 						case pb.MessageType_MESSAGE_TYPE_CAST_REMOVE:
+							ensureUserData(msg.Data.Fid)
 							stored, err := processCastRemove(db, msg)
 							if err != nil {
 								fmt.Printf("\n") // Clear progress line before error
@@ -336,10 +411,77 @@ type CastIDExport struct {
 	Hash string `json:"hash"`
 }
 
+type UserExport struct {
+	Username    string `json:"username,omitempty"`
+	DisplayName string `json:"displayName,omitempty"`
+	Avatar      string `json:"avatar,omitempty"`
+}
+
 type ThreadExport struct {
-	ParentURL   string       `json:"parentUrl"`
-	LastUpdated string       `json:"lastUpdated"`
-	RootCasts   []CastExport `json:"rootCasts"`
+	ParentURL   string                `json:"parentUrl"`
+	LastUpdated string                `json:"lastUpdated"`
+	RootCasts   []CastExport          `json:"rootCasts"`
+	Users       map[string]UserExport `json:"users"`
+}
+
+type UserCollector struct {
+	ctx    context.Context
+	db     *CommentsDB
+	client pb.HubServiceClient
+	ttl    time.Duration
+	fids   map[uint64]struct{}
+}
+
+func NewUserCollector(ctx context.Context, db *CommentsDB, client pb.HubServiceClient, ttl time.Duration) *UserCollector {
+	return &UserCollector{
+		ctx:    ctx,
+		db:     db,
+		client: client,
+		ttl:    ttl,
+		fids:   make(map[uint64]struct{}),
+	}
+}
+
+func (uc *UserCollector) RecordFID(fid uint64) {
+	if fid == 0 {
+		return
+	}
+	uc.fids[fid] = struct{}{}
+}
+
+func (uc *UserCollector) RecordMentions(fids []uint64) {
+	for _, fid := range fids {
+		uc.RecordFID(fid)
+	}
+}
+
+func (uc *UserCollector) BuildUserMap() (map[string]UserExport, error) {
+	users := make(map[string]UserExport)
+	for fid := range uc.fids {
+		cached, fresh, err := uc.db.GetCachedUser(fid, uc.ttl)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read cached user data for fid %d: %w", fid, err)
+		}
+
+		if !fresh && uc.client != nil {
+			profile, err := fetchAndCacheUserData(uc.ctx, uc.client, uc.db, fid)
+			if err != nil {
+				fmt.Printf("\nWarning: failed to refresh user data for fid %d: %v\n", fid, err)
+			} else {
+				cached = profile
+				fresh = true
+			}
+		}
+
+		if cached != nil {
+			users[strconv.FormatUint(fid, 10)] = UserExport{
+				Username:    cached.Username,
+				DisplayName: cached.DisplayName,
+				Avatar:      cached.Avatar,
+			}
+		}
+	}
+	return users, nil
 }
 
 func runExport(url string) error {
@@ -351,6 +493,24 @@ func runExport(url string) error {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
 	defer db.Close()
+
+	ctx := context.Background()
+
+	var userConn *grpc.ClientConn
+	var userClient pb.HubServiceClient
+	node := viper.GetString("node")
+	if node != "" {
+		conn, err := grpc.Dial(node, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			fmt.Printf("Warning: failed to connect to hub for user data lookups: %v\n", err)
+		} else {
+			userConn = conn
+			userClient = pb.NewHubServiceClient(conn)
+		}
+	}
+	if userConn != nil {
+		defer userConn.Close()
+	}
 
 	// Get all tracked URLs that match the prefix
 	trackedURLs, err := db.GetTrackedURLs(url)
@@ -369,6 +529,8 @@ func runExport(url string) error {
 	for _, trackedURL := range trackedURLs {
 		fmt.Printf("\nExporting: %s\n", trackedURL)
 
+		collector := NewUserCollector(ctx, db, userClient, userCacheTTL)
+
 		// Get root casts for this URL
 		rootHashes, err := db.GetRootCastsForURL(trackedURL)
 		if err != nil {
@@ -380,7 +542,7 @@ func runExport(url string) error {
 		// Build cast tree for each root
 		var rootCasts []CastExport
 		for _, hash := range rootHashes {
-			cast, err := buildCastTree(db, hash)
+			cast, err := buildCastTree(db, hash, collector)
 			if err != nil {
 				return fmt.Errorf("failed to build cast tree: %w", err)
 			}
@@ -393,10 +555,16 @@ func runExport(url string) error {
 		})
 
 		// Create export structure
+		usersMap, err := collector.BuildUserMap()
+		if err != nil {
+			return fmt.Errorf("failed to build user map: %w", err)
+		}
+
 		export := ThreadExport{
 			ParentURL:   trackedURL,
 			LastUpdated: time.Now().UTC().Format(time.RFC3339),
 			RootCasts:   rootCasts,
+			Users:       usersMap,
 		}
 
 		// Write JSON file
@@ -412,11 +580,15 @@ func runExport(url string) error {
 	return nil
 }
 
-func buildCastTree(db *CommentsDB, hash []byte) (*CastExport, error) {
+func buildCastTree(db *CommentsDB, hash []byte, collector *UserCollector) (*CastExport, error) {
 	// Get the cast message
 	msg, err := db.GetCast(hash)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get cast: %w", err)
+	}
+
+	if collector != nil {
+		collector.RecordFID(msg.Data.Fid)
 	}
 
 	// Check if removed
@@ -447,6 +619,9 @@ func buildCastTree(db *CommentsDB, hash []byte) (*CastExport, error) {
 				FID:  castId.Fid,
 				Hash: hex.EncodeToString(castId.Hash),
 			}
+			if collector != nil {
+				collector.RecordFID(castId.Fid)
+			}
 		}
 		embeds = append(embeds, embedExport)
 	}
@@ -461,6 +636,13 @@ func buildCastTree(db *CommentsDB, hash []byte) (*CastExport, error) {
 		Removed:   removed,
 	}
 
+	if collector != nil {
+		collector.RecordMentions(castBody.Mentions)
+		if parentCastId := castBody.GetParentCastId(); parentCastId != nil {
+			collector.RecordFID(parentCastId.Fid)
+		}
+	}
+
 	// Recursively get replies
 	replyHashes, err := db.GetRepliesForCast(hash)
 	if err != nil {
@@ -468,7 +650,7 @@ func buildCastTree(db *CommentsDB, hash []byte) (*CastExport, error) {
 	}
 
 	for _, replyHash := range replyHashes {
-		reply, err := buildCastTree(db, replyHash)
+		reply, err := buildCastTree(db, replyHash, collector)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build reply tree: %w", err)
 		}
