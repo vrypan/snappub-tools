@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 
 var (
 	syncStartBlock int64
+	exportOutDir   string
 )
 
 const userCacheTTL = 6 * time.Hour
@@ -62,6 +64,7 @@ func init() {
 
 	// Sync command flags
 	syncCmd.Flags().Int64Var(&syncStartBlock, "start-block", 0, "Block number to start from (0=resume from saved state, positive=specific block, negative=current-N blocks)")
+	exportCmd.Flags().StringVarP(&exportOutDir, "out", "o", ".", "Directory to write export JSON files")
 }
 
 func fetchAndCacheUserData(ctx context.Context, client pb.HubServiceClient, db *CommentsDB, fid uint64) (*CachedUserData, error) {
@@ -512,6 +515,14 @@ func runExport(url string) error {
 		defer userConn.Close()
 	}
 
+	outDir := exportOutDir
+	if outDir == "" {
+		outDir = "."
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+
 	// Get all tracked URLs that match the prefix
 	trackedURLs, err := db.GetTrackedURLs(url)
 	if err != nil {
@@ -569,11 +580,12 @@ func runExport(url string) error {
 
 		// Write JSON file
 		filename := sanitizeFilename(trackedURL) + ".json"
-		if err := writeJSONFile(filename, export); err != nil {
+		outputPath := filepath.Join(outDir, filename)
+		if err := writeJSONFile(outputPath, export); err != nil {
 			return fmt.Errorf("failed to write JSON file: %w", err)
 		}
 
-		fmt.Printf("  Exported to: %s\n", filename)
+		fmt.Printf("  Exported to: %s\n", outputPath)
 	}
 
 	fmt.Printf("\nExport complete!\n")
