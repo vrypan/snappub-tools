@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -119,7 +119,7 @@ func runSync(url string) error {
 	}
 
 	// Create gRPC connection
-	conn, err := grpc.Dial(node, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(node, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("error connecting to hub: %w", err)
 	}
@@ -142,6 +142,12 @@ func runSync(url string) error {
 		seenFids[fid] = struct{}{}
 	}
 
+	// Create shard info map for faster lookups
+	shardInfoMap := make(map[uint32]*pb.ShardInfo)
+	for _, shardInfo := range info.ShardInfos {
+		shardInfoMap[shardInfo.ShardId] = shardInfo
+	}
+
 	// Calculate start blocks for each shard before processing
 	// Shard 0 is not actively used, only process shards 1 and 2
 	shards := []uint32{1, 2}
@@ -149,17 +155,11 @@ func runSync(url string) error {
 
 	for _, shardID := range shards {
 		// Find shard info
-		var currentBlock uint64
-		for _, shardInfo := range info.ShardInfos {
-			if shardInfo.ShardId == shardID {
-				currentBlock = shardInfo.MaxHeight
-				break
-			}
-		}
-
-		if currentBlock == 0 {
+		shardInfo, ok := shardInfoMap[shardID]
+		if !ok {
 			return fmt.Errorf("shard %d not found in hub info", shardID)
 		}
+		currentBlock := shardInfo.MaxHeight
 
 		// Get last processed block for this shard
 		lastBlock, err := db.GetShardState(shardID)
@@ -193,7 +193,7 @@ func runSync(url string) error {
 	}
 
 	// Spinner characters (clockwise)
-	spinChars := []rune{'⠋', '⠙', '⠚', '⠞', '⠖', '⠦', '⠴', '⠲', '⠳', '⠓'}
+	spinChars := []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
 	checkChar := '✔'
 	spinIdx := 0
 
@@ -207,21 +207,12 @@ func runSync(url string) error {
 		startBlock := shardStartBlocks[shardID]
 
 		// Get current block height for this shard to use as stop block
-		var currentBlock uint64
-		for _, shardInfo := range info.ShardInfos {
-			if shardInfo.ShardId == shardID {
-				currentBlock = shardInfo.MaxHeight
-				break
-			}
-		}
+		currentBlock := shardInfoMap[shardID].MaxHeight
 
 		// Process in batches to avoid gRPC message size limits
-		batchSize := uint64(100)
+		const batchSize = uint64(100)
 		for batchStart := startBlock; batchStart <= currentBlock; batchStart += batchSize {
-			batchEnd := batchStart + batchSize - 1
-			if batchEnd > currentBlock {
-				batchEnd = currentBlock
-			}
+			batchEnd := min(batchStart+batchSize-1, currentBlock)
 
 			// Call GetShardChunks for this batch
 			response, err := client.GetShardChunks(ctx, &pb.ShardChunksRequest{
@@ -305,7 +296,7 @@ func runSync(url string) error {
 	for fid := range seenFids {
 		fidList = append(fidList, fid)
 	}
-	sort.Slice(fidList, func(i, j int) bool { return fidList[i] < fidList[j] })
+	slices.Sort(fidList)
 
 	if len(fidList) == 0 {
 		fmt.Printf("%c Parsing user data: no fids referenced\n", checkChar)
@@ -536,7 +527,7 @@ func runExport(url string) error {
 	var userClient pb.HubServiceClient
 	node := viper.GetString("node")
 	if node != "" {
-		conn, err := grpc.Dial(node, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(node, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			fmt.Printf("Warning: failed to connect to hub for user data lookups: %v\n", err)
 		} else {
@@ -594,8 +585,14 @@ func runExport(url string) error {
 		}
 
 		// Sort by timestamp
-		sort.Slice(rootCasts, func(i, j int) bool {
-			return rootCasts[i].Timestamp < rootCasts[j].Timestamp
+		slices.SortFunc(rootCasts, func(a, b CastExport) int {
+			if a.Timestamp < b.Timestamp {
+				return -1
+			}
+			if a.Timestamp > b.Timestamp {
+				return 1
+			}
+			return 0
 		})
 
 		// Create export structure
@@ -653,7 +650,7 @@ func buildCastTree(db *CommentsDB, hash []byte, collector *UserCollector) (*Cast
 	isoTime := time.Unix(timestamp, 0).UTC().Format(time.RFC3339)
 
 	// Build embeds
-	var embeds []EmbedExport
+	embeds := make([]EmbedExport, 0, len(castBody.Embeds))
 	for _, embed := range castBody.Embeds {
 		embedExport := EmbedExport{}
 		if embed.GetUrl() != "" {
@@ -694,6 +691,7 @@ func buildCastTree(db *CommentsDB, hash []byte, collector *UserCollector) (*Cast
 		return nil, fmt.Errorf("failed to get replies: %w", err)
 	}
 
+	cast.Replies = make([]CastExport, 0, len(replyHashes))
 	for _, replyHash := range replyHashes {
 		reply, err := buildCastTree(db, replyHash, collector)
 		if err != nil {
@@ -703,8 +701,14 @@ func buildCastTree(db *CommentsDB, hash []byte, collector *UserCollector) (*Cast
 	}
 
 	// Sort replies by timestamp
-	sort.Slice(cast.Replies, func(i, j int) bool {
-		return cast.Replies[i].Timestamp < cast.Replies[j].Timestamp
+	slices.SortFunc(cast.Replies, func(a, b CastExport) int {
+		if a.Timestamp < b.Timestamp {
+			return -1
+		}
+		if a.Timestamp > b.Timestamp {
+			return 1
+		}
+		return 0
 	})
 
 	return cast, nil
@@ -727,7 +731,7 @@ func sanitizeFilename(url string) string {
 	return filename
 }
 
-func writeJSONFile(filename string, data interface{}) error {
+func writeJSONFile(filename string, data any) error {
 	file, err := os.Create(filename)
 	if err != nil {
 		return err
