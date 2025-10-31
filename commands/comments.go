@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -418,14 +419,15 @@ func processCastRemove(db *CommentsDB, msg *pb.Message) (bool, error) {
 
 // JSON export structures
 type CastExport struct {
-	Hash      string        `json:"hash"`
-	FID       uint64        `json:"fid"`
-	Timestamp string        `json:"timestamp"`
-	Text      string        `json:"text"`
-	Embeds    []EmbedExport `json:"embeds,omitempty"`
-	Mentions  []uint64      `json:"mentions,omitempty"`
-	Removed   bool          `json:"removed"`
-	Replies   []CastExport  `json:"replies,omitempty"`
+	Hash              string        `json:"hash"`
+	FID               uint64        `json:"fid"`
+	Timestamp         string        `json:"timestamp"`
+	Text              string        `json:"text"`
+	Embeds            []EmbedExport `json:"embeds,omitempty"`
+	Mentions          []uint64      `json:"mentions,omitempty"`
+	MentionsPositions []uint32      `json:"mentionsPositions,omitempty"`
+	Removed           bool          `json:"removed"`
+	Replies           []CastExport  `json:"replies,omitempty"`
 }
 
 type EmbedExport struct {
@@ -601,6 +603,10 @@ func runExport(url string) error {
 			return fmt.Errorf("failed to build user map: %w", err)
 		}
 
+		for i := range rootCasts {
+			applyMentionsToCast(&rootCasts[i], usersMap)
+		}
+
 		export := ThreadExport{
 			ParentURL:   trackedURL,
 			LastUpdated: time.Now().UTC().Format(time.RFC3339),
@@ -669,13 +675,14 @@ func buildCastTree(db *CommentsDB, hash []byte, collector *UserCollector) (*Cast
 	}
 
 	cast := &CastExport{
-		Hash:      hex.EncodeToString(hash),
-		FID:       msg.Data.Fid,
-		Timestamp: isoTime,
-		Text:      castBody.Text,
-		Embeds:    embeds,
-		Mentions:  castBody.Mentions,
-		Removed:   removed,
+		Hash:              hex.EncodeToString(hash),
+		FID:               msg.Data.Fid,
+		Timestamp:         isoTime,
+		Text:              castBody.Text,
+		Embeds:            embeds,
+		Mentions:          castBody.Mentions,
+		MentionsPositions: castBody.MentionsPositions,
+		Removed:           removed,
 	}
 
 	if collector != nil {
@@ -712,6 +719,160 @@ func buildCastTree(db *CommentsDB, hash []byte, collector *UserCollector) (*Cast
 	})
 
 	return cast, nil
+}
+
+func applyMentionsToCast(cast *CastExport, users map[string]UserExport) {
+	cast.Text = injectMentions(cast.Text, cast.Mentions, cast.MentionsPositions, users)
+	for i := range cast.Replies {
+		applyMentionsToCast(&cast.Replies[i], users)
+	}
+}
+
+func injectMentions(text string, mentions []uint64, positions []uint32, users map[string]UserExport) string {
+	if len(mentions) == 0 || len(positions) == 0 {
+		return text
+	}
+
+	limit := len(mentions)
+	if len(positions) < limit {
+		limit = len(positions)
+	}
+	if limit == 0 {
+		return text
+	}
+
+	runes := []rune(text)
+	byteOffsets := make([]int, len(runes))
+	idx := 0
+	for byteIdx := range text {
+		if idx < len(byteOffsets) {
+			byteOffsets[idx] = byteIdx
+		}
+		idx++
+	}
+
+	type replacement struct {
+		runeIdx     int
+		insert      string
+		replaceSpan int
+	}
+
+	repls := make([]replacement, 0, limit)
+
+	for i := 0; i < limit; i++ {
+		pos := int(positions[i])
+		if pos < 0 {
+			continue
+		}
+
+		fid := mentions[i]
+		fidKey := strconv.FormatUint(fid, 10)
+		username := users[fidKey].Username
+		if username == "" {
+			username = fidKey
+		}
+		mentionText := "@" + username
+
+		if pos > len(text) {
+			continue
+		}
+
+		if pos == len(text) {
+			repls = append(repls, replacement{
+				runeIdx:     len(runes),
+				insert:      mentionText,
+				replaceSpan: 0,
+			})
+			continue
+		}
+
+		runeIdx, found := slices.BinarySearch(byteOffsets, pos)
+		if !found || runeIdx < 0 || runeIdx > len(runes) {
+			// Position does not align to rune boundary; skip rather than risk corruption
+			continue
+		}
+
+		replaceSpan := 0
+		if runeIdx < len(runes) {
+			switch runes[runeIdx] {
+			case '\u001a', '\ufffc':
+				replaceSpan = 1
+			case '@':
+				if existing, length := extractExistingMention(runes[runeIdx:]); length > 0 {
+					if existing == mentionText {
+						continue
+					}
+					replaceSpan = length
+				}
+			}
+		}
+
+		repls = append(repls, replacement{
+			runeIdx:     runeIdx,
+			insert:      mentionText,
+			replaceSpan: replaceSpan,
+		})
+	}
+
+	if len(repls) == 0 {
+		return text
+	}
+
+	slices.SortFunc(repls, func(a, b replacement) int {
+		switch {
+		case a.runeIdx < b.runeIdx:
+			return -1
+		case a.runeIdx > b.runeIdx:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	var builder strings.Builder
+	builder.Grow(len(text) + len(repls)*8)
+
+	current := 0
+	for _, repl := range repls {
+		if repl.runeIdx > len(runes) {
+			repl.runeIdx = len(runes)
+		}
+
+		for current < repl.runeIdx && current < len(runes) {
+			builder.WriteRune(runes[current])
+			current++
+		}
+
+		builder.WriteString(repl.insert)
+		current += repl.replaceSpan
+		if current < 0 {
+			current = 0
+		}
+	}
+
+	for current < len(runes) {
+		builder.WriteRune(runes[current])
+		current++
+	}
+
+	return builder.String()
+}
+
+func extractExistingMention(runes []rune) (string, int) {
+	if len(runes) == 0 || runes[0] != '@' {
+		return "", 0
+	}
+
+	length := 1
+	for length < len(runes) {
+		r := runes[length]
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			length++
+			continue
+		}
+		break
+	}
+	return string(runes[:length]), length
 }
 
 func sanitizeFilename(url string) string {
