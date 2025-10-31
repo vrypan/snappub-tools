@@ -192,8 +192,8 @@ func runSync(url string) error {
 		shardStartBlocks[shardID] = startBlock
 	}
 
-	// Spinner characters
-	spinChars := []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
+	// Spinner characters (clockwise)
+	spinChars := []rune{'⠋', '⠙', '⠚', '⠞', '⠖', '⠦', '⠴', '⠲', '⠳', '⠓'}
 	checkChar := '✔'
 	spinIdx := 0
 
@@ -292,13 +292,13 @@ func runSync(url string) error {
 
 				// Update progress line with spinner
 				spinIdx = (spinIdx + 1) % len(spinChars)
-				fmt.Printf("\rParsing blocks %c [%d Chunks]  Cast Add: %d  Remove: %d",
+				fmt.Printf("\r%c Parsing blocks [%d Chunks]  Cast Add: %d  Remove: %d",
 					spinChars[spinIdx], totalChunksProcessed, totalCastsStored, totalRemovesStored)
 			}
 		} // End batch loop
 	}
 
-	fmt.Printf("\rParsing blocks %c [%d Chunks]  Cast Add: %d  Remove: %d\n",
+	fmt.Printf("\r%c Parsing blocks [%d Chunks]  Cast Add: %d  Remove: %d\n",
 		checkChar, totalChunksProcessed, totalCastsStored, totalRemovesStored)
 
 	fidList := make([]uint64, 0, len(seenFids))
@@ -308,11 +308,12 @@ func runSync(url string) error {
 	sort.Slice(fidList, func(i, j int) bool { return fidList[i] < fidList[j] })
 
 	if len(fidList) == 0 {
-		fmt.Println("User data: no fids referenced")
+		fmt.Printf("%c Parsing user data: no fids referenced\n", checkChar)
 	} else {
 		totalFids := len(fidList)
 		processedUsers := 0
-		fmt.Printf("User data: %d/%d", processedUsers, totalFids)
+		userSpinIdx := 0
+		fmt.Printf("User data %c [%d/%d]", spinChars[userSpinIdx], processedUsers, totalFids)
 		for _, fid := range fidList {
 			cached, fresh, err := db.GetCachedUser(fid, userCacheTTL)
 			if err != nil {
@@ -331,9 +332,10 @@ func runSync(url string) error {
 				}
 			}
 			processedUsers++
-			fmt.Printf("\rUser data: %d/%d", processedUsers, totalFids)
+			userSpinIdx = (userSpinIdx + 1) % len(spinChars)
+			fmt.Printf("\r%c Parsing user data [%d/%d]", spinChars[userSpinIdx], processedUsers, totalFids)
 		}
-		fmt.Printf("\n")
+		fmt.Printf("\r%c Parsing user data [%d/%d]\n", checkChar, totalFids, totalFids)
 	}
 
 	fmt.Printf("\nSync complete!\n")
@@ -344,6 +346,15 @@ func processCastAdd(db *CommentsDB, msg *pb.Message, targetURL string, blockNum 
 	castBody := msg.Data.GetCastAddBody()
 	if castBody == nil {
 		return false, nil
+	}
+
+	// Skip if we already have this cast stored
+	exists, err := db.CastExists(msg.Hash)
+	if err != nil {
+		return false, err
+	}
+	if exists {
+		return true, nil
 	}
 
 	parentUrl := castBody.GetParentUrl()
