@@ -480,3 +480,18 @@ func (cdb *CommentsDB) StoreCachedUser(data *CachedUserData) error {
 		return txn.Set(userKey(data.Fid), payload)
 	})
 }
+
+// StoreUserPlaceholder ensures a cache entry exists for a fid without marking it fresh
+func (cdb *CommentsDB) StoreUserPlaceholder(fid uint64) error {
+	placeholder := CachedUserData{
+		Fid:       fid,
+		UpdatedAt: 0,
+	}
+	payload, err := json.Marshal(placeholder)
+	if err != nil {
+		return fmt.Errorf("failed to marshal user placeholder: %w", err)
+	}
+	return cdb.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(userKey(fid), payload)
+	})
+}

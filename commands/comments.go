@@ -134,29 +134,12 @@ func runSync(url string) error {
 		return fmt.Errorf("failed to get hub info: %w", err)
 	}
 
-	processedFids := make(map[uint64]struct{})
-	ensureUserData := func(fid uint64) {
+	seenFids := make(map[uint64]struct{})
+	recordFID := func(fid uint64) {
 		if fid == 0 {
 			return
 		}
-		if _, seen := processedFids[fid]; seen {
-			return
-		}
-
-		_, fresh, err := db.GetCachedUser(fid, userCacheTTL)
-		if err != nil {
-			fmt.Printf("\nWarning: failed to read cached user data for fid %d: %v\n", fid, err)
-			processedFids[fid] = struct{}{}
-			return
-		}
-
-		if !fresh {
-			if _, err := fetchAndCacheUserData(ctx, client, db, fid); err != nil {
-				fmt.Printf("\nWarning: failed to fetch user data for fid %d: %v\n", fid, err)
-			}
-		}
-
-		processedFids[fid] = struct{}{}
+		seenFids[fid] = struct{}{}
 	}
 
 	// Calculate start blocks for each shard before processing
@@ -261,34 +244,38 @@ func runSync(url string) error {
 						// Process based on message type
 						switch msg.Data.Type {
 						case pb.MessageType_MESSAGE_TYPE_CAST_ADD:
-							ensureUserData(msg.Data.Fid)
 							castBody := msg.Data.GetCastAddBody()
-							if castBody != nil {
-								for _, fid := range castBody.Mentions {
-									ensureUserData(fid)
-								}
-								if parentCastId := castBody.GetParentCastId(); parentCastId != nil {
-									ensureUserData(parentCastId.Fid)
-								}
-							}
-
 							stored, err := processCastAdd(db, msg, url, blockNum, uint64(msgIdx))
 							if err != nil {
 								fmt.Printf("\n") // Clear progress line before error
 								return fmt.Errorf("failed to process cast add: %w", err)
 							}
 							if stored {
+								recordFID(msg.Data.Fid)
+								if castBody != nil {
+									for _, fid := range castBody.Mentions {
+										recordFID(fid)
+									}
+									if parentCastId := castBody.GetParentCastId(); parentCastId != nil {
+										recordFID(parentCastId.Fid)
+									}
+									for _, embed := range castBody.Embeds {
+										if embed.GetCastId() != nil {
+											recordFID(embed.GetCastId().Fid)
+										}
+									}
+								}
 								totalCastsStored++
 							}
 
 						case pb.MessageType_MESSAGE_TYPE_CAST_REMOVE:
-							ensureUserData(msg.Data.Fid)
 							stored, err := processCastRemove(db, msg)
 							if err != nil {
 								fmt.Printf("\n") // Clear progress line before error
 								return fmt.Errorf("failed to process cast remove: %w", err)
 							}
 							if stored {
+								recordFID(msg.Data.Fid)
 								totalRemovesStored++
 							}
 						}
@@ -305,14 +292,49 @@ func runSync(url string) error {
 
 				// Update progress line with spinner
 				spinIdx = (spinIdx + 1) % len(spinChars)
-				fmt.Printf("\r%c [%d Chunks]  Cast Add: %d  Remove: %d",
+				fmt.Printf("\rParsing blocks %c [%d Chunks]  Cast Add: %d  Remove: %d",
 					spinChars[spinIdx], totalChunksProcessed, totalCastsStored, totalRemovesStored)
 			}
 		} // End batch loop
 	}
 
-	fmt.Printf("\r%c [%d Chunks]  Cast Add: %d  Remove: %d\n",
+	fmt.Printf("\rParsing blocks %c [%d Chunks]  Cast Add: %d  Remove: %d\n",
 		checkChar, totalChunksProcessed, totalCastsStored, totalRemovesStored)
+
+	fidList := make([]uint64, 0, len(seenFids))
+	for fid := range seenFids {
+		fidList = append(fidList, fid)
+	}
+	sort.Slice(fidList, func(i, j int) bool { return fidList[i] < fidList[j] })
+
+	if len(fidList) == 0 {
+		fmt.Println("User data: no fids referenced")
+	} else {
+		totalFids := len(fidList)
+		processedUsers := 0
+		fmt.Printf("User data: %d/%d", processedUsers, totalFids)
+		for _, fid := range fidList {
+			cached, fresh, err := db.GetCachedUser(fid, userCacheTTL)
+			if err != nil {
+				fmt.Printf("\nWarning: failed to read cached user data for fid %d: %v\n", fid, err)
+				fresh = false
+			}
+			if cached == nil {
+				if err := db.StoreUserPlaceholder(fid); err != nil {
+					fmt.Printf("\nWarning: failed to store user placeholder for fid %d: %v\n", fid, err)
+				}
+				fresh = false
+			}
+			if !fresh {
+				if _, err := fetchAndCacheUserData(ctx, client, db, fid); err != nil {
+					fmt.Printf("\nWarning: failed to fetch user data for fid %d: %v\n", fid, err)
+				}
+			}
+			processedUsers++
+			fmt.Printf("\rUser data: %d/%d", processedUsers, totalFids)
+		}
+		fmt.Printf("\n")
+	}
 
 	fmt.Printf("\nSync complete!\n")
 	return nil
